@@ -1,0 +1,61 @@
+{
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "defaultErrnoRet": 1,
+  "archMap": [
+    {
+      "architecture": "SCMP_ARCH_X86_64",
+      "subArchitectures": [
+        "SCMP_ARCH_X86",
+        "SCMP_ARCH_X32"
+      ]
+    },
+    {
+      "architecture": "SCMP_ARCH_AARCH64",
+      "subArchitectures": [
+        "SCMP_ARCH_ARM"
+      ]
+    }
+  ],
+  "syscalls": [
+    {
+      "names": [
+        "bpf",
+        "userfaultfd",
+        "io_uring_setup",
+        "io_uring_enter",
+        "io_uring_register",
+        "kexec_load",
+        "kexec_file_load",
+        "keyctl",
+        "add_key",
+        "request_key",
+        "perf_event_open",
+        "lookup_dcookie",
+        "open_by_handle_at",
+        "fanotify_init",
+        "kcmp",
+        "process_vm_readv",
+        "process_vm_writev",
+        "ptrace",
+        "reboot",
+        "swapon",
+        "swapoff",
+        "nfsservctl",
+        "init_module",
+        "finit_module",
+        "delete_module",
+        "acct",
+        "settimeofday",
+        "clock_settime",
+        "clock_adjtime",
+        "adjtimex",
+        "vm86",
+        "vm86old",
+        "modify_ldt"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1,
+      "comment": "Block dangerous syscalls: kernel module loading, BPF, io_uring, key management, process inspection, time manipulation, reboot. nsjail needs clone/unshare/mount/pivot_root/setns/chroot which remain allowed by the default ALLOW action."
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+# CP Compiler v2.2
+# Core
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+pydantic-settings==2.6.1
+
+# Observability (optional — graceful fallback if missing)
+prometheus-client>=0.20.0
+
+# Utils
+python-dotenv==1.0.1
+slowapi==0.1.9

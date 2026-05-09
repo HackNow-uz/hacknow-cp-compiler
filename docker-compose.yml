@@ -1,0 +1,46 @@
+services:
+  cp-compiler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    env_file:
+      - .env
+    tmpfs:
+      - /compiler-temp:size=512M,exec,mode=1777
+    privileged: false
+    cap_add:
+      - SYS_ADMIN
+      - SYS_PTRACE
+      - SYS_CHROOT
+      - SETUID
+      - SETGID
+    cap_drop:
+      - NET_ADMIN
+      - MKNOD
+      - AUDIT_WRITE
+    security_opt:
+      - apparmor:unconfined
+      - seccomp:./docker/seccomp-profile.json
+      - no-new-privileges:true
+    deploy:
+      # Scale replicas for contest load:
+      #   docker compose up -d --scale cp-compiler=3
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.0"
+        reservations:
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
