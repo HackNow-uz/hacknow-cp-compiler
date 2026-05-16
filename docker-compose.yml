@@ -10,6 +10,8 @@ services:
       - .env
     tmpfs:
       - /compiler-temp:size=512M,exec,mode=1777
+    volumes:
+      - test-data:/test-data:ro
     privileged: false
     cap_add:
       - SYS_ADMIN
@@ -44,3 +46,7 @@ services:
       options:
         max-size: "50m"
         max-file: "5"
+
+volumes:
+  test-data:
+    driver: local

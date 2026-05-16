@@ -35,13 +35,28 @@ class RunRequest(BaseModel):
 
 
 class TestCase(BaseModel):
-    """Single test case for judging."""
+    """Single test case for judging.
+
+    Supports two modes:
+      - Inline: input/expected_output as strings (max 10MB each).
+      - File-based: input_path/expected_output_path pointing to files under /test-data/.
+    At least one of (input, input_path) must be provided.
+    """
 
     id: str = Field(..., max_length=64, pattern=r"^[A-Za-z0-9_\-.]+$",
                     description="Test case identifier")
-    input: str = Field(..., max_length=10_000_000, description="Stdin input data")
-    expected_output: str = Field(..., max_length=10_000_000,
-                                  description="Expected stdout output")
+    input: Optional[str] = Field(default=None, max_length=10_000_000,
+                                 description="Stdin input data (inline)")
+    expected_output: Optional[str] = Field(default=None, max_length=10_000_000,
+                                           description="Expected stdout output (inline)")
+    input_path: Optional[str] = Field(
+        default=None, max_length=512,
+        description="Path to input file under /test-data/ (file-based mode)",
+    )
+    expected_output_path: Optional[str] = Field(
+        default=None, max_length=512,
+        description="Path to expected output file under /test-data/ (file-based mode)",
+    )
     score: int = Field(default=10, ge=0, le=10000, description="Points for this test")
     time_limit_ms: Optional[int] = Field(
         default=None, ge=100, le=30000,
@@ -55,6 +70,16 @@ class TestCase(BaseModel):
         default=None, max_length=64, pattern=r"^[A-Za-z0-9_\-.]+$",
         description="Subtask identifier for IOI-style grouping",
     )
+
+    @model_validator(mode="after")
+    def _validate_input_source(self):
+        if self.input is None and self.input_path is None:
+            raise ValueError(f"Test '{self.id}': either 'input' or 'input_path' must be provided")
+        if self.expected_output is None and self.expected_output_path is None:
+            raise ValueError(
+                f"Test '{self.id}': either 'expected_output' or 'expected_output_path' must be provided"
+            )
+        return self
 
 
 class Subtask(BaseModel):
@@ -100,6 +125,19 @@ class CheckerConfig(BaseModel):
     epsilon: float = Field(
         default=1e-6,
         description="Tolerance for float checker type",
+    )
+
+
+class InteractiveConfig(BaseModel):
+    """Configuration for interactive problems (two-process communication)."""
+
+    interactor_code: str = Field(
+        ..., min_length=1, max_length=100_000,
+        description="Interactor source code (communicates with submission via stdin/stdout)",
+    )
+    interactor_language_id: str = Field(
+        default="cpp",
+        description="Language of the interactor code",
     )
 
 
@@ -151,6 +189,10 @@ class JudgeRequest(BaseModel):
         default=None,
         description="IOI-style subtask groups with per-subtask aggregation and dependencies.",
     )
+    interactive: Optional[InteractiveConfig] = Field(
+        default=None,
+        description="Interactive problem config. When set, interactor communicates with submission via pipes.",
+    )
 
     @model_validator(mode="after")
     def _validate_subtasks(self):
@@ -176,10 +218,14 @@ class JudgeRequest(BaseModel):
 
     @model_validator(mode="after")
     def _validate_total_size(self):
-        # Cap aggregate test data to prevent memory exhaustion via 100x10MB requests.
-        total = sum(len(t.input) + len(t.expected_output) for t in self.tests)
+        # Cap aggregate INLINE test data to prevent memory exhaustion.
+        # File-based tests are streamed from disk and don't count here.
+        total = sum(
+            len(t.input or "") + len(t.expected_output or "")
+            for t in self.tests
+        )
         if total > 200 * 1024 * 1024:  # 200 MB aggregate cap
             raise ValueError(
-                f"Total test data size {total} exceeds 200MB limit"
+                f"Total inline test data size {total} exceeds 200MB limit"
             )
         return self

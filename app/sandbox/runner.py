@@ -19,6 +19,101 @@ logger = logging.getLogger(__name__)
 class SecurityError(Exception):
     """Raised when a security invariant is violated."""
 
+
+# ─────────────────────────────────────────────────────────────────────────
+#  File-based test helpers
+# ─────────────────────────────────────────────────────────────────────────
+
+def _validate_test_file_path(path: str) -> str:
+    """Validate and resolve a test file path. Must be under test_data_dir."""
+    resolved = os.path.realpath(path)
+    allowed_root = os.path.realpath(settings.test_data_dir)
+    if not resolved.startswith(allowed_root + os.sep) and resolved != allowed_root:
+        raise SecurityError(f"Test file path escapes allowed directory: {path}")
+    if not os.path.isfile(resolved):
+        raise FileNotFoundError(f"Test file not found: {path}")
+    size_mb = os.path.getsize(resolved) / (1024 * 1024)
+    if size_mb > settings.max_test_file_size_mb:
+        raise ValueError(
+            f"Test file {path} is {size_mb:.1f}MB, exceeds {settings.max_test_file_size_mb}MB limit"
+        )
+    return resolved
+
+
+def read_test_data(inline: str | None, file_path: str | None) -> str:
+    """Read test data from inline string or file. File-based is read from disk."""
+    if inline is not None:
+        return inline
+    if file_path is not None:
+        resolved = _validate_test_file_path(file_path)
+        with open(resolved, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    return ""
+
+
+async def stream_file_to_stdin(
+    proc_stdin: asyncio.StreamWriter,
+    file_path: str,
+    chunk_size: int = 65536,
+) -> None:
+    """Stream a file to process stdin in chunks without loading into memory."""
+    resolved = _validate_test_file_path(file_path)
+    loop = asyncio.get_running_loop()
+
+    fd = await loop.run_in_executor(None, lambda: open(resolved, "rb"))
+    try:
+        while True:
+            chunk = await loop.run_in_executor(None, fd.read, chunk_size)
+            if not chunk:
+                break
+            try:
+                proc_stdin.write(chunk)
+                await proc_stdin.drain()
+            except Exception:
+                break
+    finally:
+        await loop.run_in_executor(None, fd.close)
+        try:
+            proc_stdin.close()
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  Disk usage monitoring
+# ─────────────────────────────────────────────────────────────────────────
+
+def check_disk_pressure() -> bool:
+    """Return True if /compiler-temp is under disk pressure (exceeds threshold)."""
+    try:
+        st = os.statvfs(settings.compiler_temp_dir)
+        total = st.f_blocks * st.f_frsize
+        if total == 0:
+            return False
+        used = (st.f_blocks - st.f_bavail) * st.f_frsize
+        usage = used / total
+        return usage >= settings.temp_disk_usage_threshold
+    except OSError:
+        return False
+
+
+def get_temp_usage_mb() -> int:
+    """Return temp directory usage in MB."""
+    try:
+        total = 0
+        for entry in os.scandir(settings.compiler_temp_dir):
+            if entry.is_dir(follow_symlinks=False):
+                for root, dirs, files in os.walk(entry.path):
+                    for f in files:
+                        try:
+                            total += os.path.getsize(os.path.join(root, f))
+                        except OSError:
+                            pass
+        return total // (1024 * 1024)
+    except OSError:
+        return 0
+
+
 _GO_LANG_IDS = frozenset({"go"})
 _JVM_LANG_IDS = frozenset({"java", "kotlin"})
 _HASKELL_LANG_IDS = frozenset({"haskell"})
@@ -214,9 +309,6 @@ class NsjailRunner:
             "--cwd", "/sandbox",
             "--disable_proc",
             "--iface_no_lo",
-            # nsjail-layer seccomp: block syscalls user code never needs but
-            # that the Docker-level allow-list permits. Defense in depth in
-            # case a kernel CVE allows escaping nsjail's namespace isolation.
             # nsjail-layer seccomp: block dangerous syscalls user code never
             # legitimately needs. Defense in depth atop Docker-level seccomp.
             "--seccomp_string",
@@ -513,6 +605,32 @@ class NsjailRunner:
         """Release cache ref_count when judge is done with compiled artifacts."""
         self._compile_cache.release(language_id, source_code)
 
+    def _prepare_work_dir(self, compiled_dir: str) -> str:
+        """Create a fresh work dir with hardlinked compiled artifacts."""
+        work_dir = tempfile.mkdtemp(dir=settings.compiler_temp_dir)
+        os.chmod(work_dir, 0o700)
+
+        for item in os.listdir(compiled_dir):
+            src_path = os.path.join(compiled_dir, item)
+            dst_path = os.path.join(work_dir, item)
+            st = os.lstat(src_path)
+            if stat.S_ISREG(st.st_mode):
+                try:
+                    os.link(src_path, dst_path)
+                except OSError:
+                    shutil.copy2(src_path, dst_path, follow_symlinks=False)
+            elif stat.S_ISDIR(st.st_mode):
+                shutil.copytree(src_path, dst_path, symlinks=False)
+            else:
+                raise SecurityError(f"unexpected file type: {src_path}")
+
+        for item in os.listdir(work_dir):
+            try:
+                os.chmod(os.path.join(work_dir, item), 0o555)
+            except OSError:
+                pass
+        return work_dir
+
     async def run_test(
         self,
         language: LanguageConfig,
@@ -520,42 +638,191 @@ class NsjailRunner:
         input_data: str,
         time_limit_ms: int,
         memory_limit_mb: int,
+        input_file_path: str | None = None,
     ) -> ExecutionResult:
-        """Run a single test case using pre-compiled artifacts."""
-        work_dir = tempfile.mkdtemp(dir=settings.compiler_temp_dir)
-        os.chmod(work_dir, 0o700)
+        """Run a single test case using pre-compiled artifacts.
+
+        If input_file_path is given, stdin is streamed from that file
+        instead of using in-memory input_data.
+        """
+        work_dir = self._prepare_work_dir(compiled_dir)
 
         try:
-            for item in os.listdir(compiled_dir):
-                src = os.path.join(compiled_dir, item)
-                dst = os.path.join(work_dir, item)
-                st = os.lstat(src)
-                if stat.S_ISREG(st.st_mode):
-                    try:
-                        os.link(src, dst)
-                    except OSError:
-                        shutil.copy2(src, dst, follow_symlinks=False)
-                elif stat.S_ISDIR(st.st_mode):
-                    shutil.copytree(src, dst, symlinks=False)
-                else:
-                    raise SecurityError(f"unexpected file type: {src}")
-
-            for item in os.listdir(work_dir):
-                try:
-                    os.chmod(os.path.join(work_dir, item), 0o555)
-                except OSError:
-                    pass
-
             return await self._run_in_nsjail(
                 language=language,
                 work_dir=work_dir,
                 input_data=input_data,
                 time_limit_ms=time_limit_ms,
                 memory_limit_mb=memory_limit_mb,
+                input_file_path=input_file_path,
             )
-
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Interactive problem support
+    # ─────────────────────────────────────────────────────────────────────
+    async def run_interactive(
+        self,
+        language: LanguageConfig,
+        compiled_dir: str,
+        interactor_dir: str,
+        interactor_language: LanguageConfig,
+        test_input: str,
+        time_limit_ms: int,
+        memory_limit_mb: int,
+    ) -> tuple[ExecutionResult, ExecutionResult]:
+        """Run submission and interactor connected via pipes.
+
+        Returns (submission_result, interactor_result).
+        Interactor receives test_input on a header line, then communicates
+        with submission via piped stdout/stdin relay.
+        """
+        sub_dir = self._prepare_work_dir(compiled_dir)
+        int_dir = self._prepare_work_dir(interactor_dir)
+
+        try:
+            sub_cmd = []
+            for part in language.run_cmd:
+                sub_cmd.append(
+                    part.replace("{memory}", str(memory_limit_mb))
+                    if "{memory}" in part else part
+                )
+
+            int_cmd = []
+            for part in interactor_language.run_cmd:
+                int_cmd.append(
+                    part.replace("{memory}", str(memory_limit_mb))
+                    if "{memory}" in part else part
+                )
+
+            time_wrapper = [
+                "/usr/bin/time",
+                "-f", "RESOURCE_USAGE\nUSER_TIME:%U\nSYS_TIME:%S\nMEM:%M\nEXIT:%x",
+            ]
+
+            sub_nsjail = self._get_nsjail_command(
+                work_dir=sub_dir,
+                time_limit_ms=time_limit_ms,
+                memory_limit_mb=memory_limit_mb,
+                cmd=time_wrapper + sub_cmd,
+                language=language,
+            )
+            int_nsjail = self._get_nsjail_command(
+                work_dir=int_dir,
+                time_limit_ms=time_limit_ms + 2000,
+                memory_limit_mb=256,
+                cmd=time_wrapper + int_cmd,
+                language=interactor_language,
+            )
+
+            max_output = settings.output_limit_mb * 1024 * 1024
+            max_stderr = settings.stderr_limit_kb * 1024
+            wall_timeout = (time_limit_ms / 1000.0) + 8.0
+            idle_timeout = settings.interactive_idle_timeout_ms / 1000.0
+
+            # Acquire per-language semaphores in sorted order to prevent
+            # deadlock when two concurrent requests use languages in opposite roles.
+            sem_a = self.get_semaphore(language.id)
+            sem_b = self.get_semaphore(interactor_language.id)
+            if language.id > interactor_language.id:
+                sem_a, sem_b = sem_b, sem_a
+
+            async with self._global_semaphore, sem_a, sem_b:
+                start_t = time.time()
+
+                sub_proc = await asyncio.create_subprocess_exec(
+                    *sub_nsjail,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                int_proc = await asyncio.create_subprocess_exec(
+                    *int_nsjail,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+
+                async def _relay(src, dst, max_bytes):
+                    """Relay data from src to dst, up to max_bytes."""
+                    total = 0
+                    try:
+                        while total < max_bytes:
+                            chunk = await asyncio.wait_for(
+                                src.read(4096), timeout=idle_timeout,
+                            )
+                            if not chunk:
+                                break
+                            total += len(chunk)
+                            dst.write(chunk)
+                            await asyncio.wait_for(dst.drain(), timeout=idle_timeout)
+                    except (asyncio.TimeoutError, Exception):
+                        pass
+                    finally:
+                        try:
+                            dst.close()
+                        except Exception:
+                            pass
+
+                async def _run_pipes():
+                    # Send test input to interactor stdin header
+                    try:
+                        int_proc.stdin.write(test_input.encode())
+                        int_proc.stdin.write(b"\n")
+                        await int_proc.stdin.drain()
+                    except Exception:
+                        pass
+                    # Bidirectional relay
+                    await asyncio.gather(
+                        _relay(int_proc.stdout, sub_proc.stdin, max_output),
+                        _relay(sub_proc.stdout, int_proc.stdin, max_output),
+                    )
+
+                try:
+                    sub_stderr_task = asyncio.create_task(
+                        self._read_capped(sub_proc.stderr, max_stderr)
+                    )
+                    int_stderr_task = asyncio.create_task(
+                        self._read_capped(int_proc.stderr, max_stderr)
+                    )
+
+                    await asyncio.wait_for(_run_pipes(), timeout=wall_timeout)
+                    await asyncio.gather(sub_proc.wait(), int_proc.wait())
+                    elapsed_ms = int((time.time() - start_t) * 1000)
+
+                    sub_stderr = (await sub_stderr_task).decode("utf-8", "replace")
+                    int_stderr = (await int_stderr_task).decode("utf-8", "replace")
+
+                except asyncio.TimeoutError:
+                    for p in (sub_proc, int_proc):
+                        try:
+                            p.kill()
+                        except Exception:
+                            pass
+                    return (
+                        ExecutionResult(124, "", "", time_limit_ms + 1, 0, True),
+                        ExecutionResult(124, "", "", time_limit_ms + 1, 0, True),
+                    )
+
+                def _build_result(proc, stderr_raw):
+                    stderr_str, cpu_time, mem_kb = self._parse_time_output(stderr_raw)
+                    t_ms = int(cpu_time * 1000) if cpu_time > 0 else elapsed_ms
+                    return ExecutionResult(
+                        exit_code=proc.returncode,
+                        stdout="",
+                        stderr=stderr_str,
+                        time_ms=t_ms,
+                        memory_kb=mem_kb,
+                        timed_out=(proc.returncode in (137, 124, 152)),
+                        memory_exceeded=(proc.returncode == 139),
+                    )
+
+                return _build_result(sub_proc, sub_stderr), _build_result(int_proc, int_stderr)
+
+        finally:
+            shutil.rmtree(sub_dir, ignore_errors=True)
+            shutil.rmtree(int_dir, ignore_errors=True)
 
     # ─────────────────────────────────────────────────────────────────────────
     # INTERNAL: Shared nsjail execution logic
@@ -568,8 +835,13 @@ class NsjailRunner:
         input_data: str,
         time_limit_ms: int,
         memory_limit_mb: int,
+        input_file_path: str | None = None,
     ) -> ExecutionResult:
-        """Run code in nsjail sandbox with resource tracking."""
+        """Run code in nsjail sandbox with resource tracking.
+
+        If input_file_path is provided, stdin is streamed from that file
+        in 64KB chunks instead of loading input_data into memory.
+        """
         run_cmd = []
         for part in language.run_cmd:
             if "{memory}" in part:
@@ -607,19 +879,24 @@ class NsjailRunner:
                     stderr=asyncio.subprocess.PIPE
                 )
 
-                input_bytes = input_data.encode()
+                # Choose stdin feeding strategy: file streaming or in-memory
+                if input_file_path:
+                    async def _feed_stdin():
+                        await stream_file_to_stdin(proc.stdin, input_file_path)
+                else:
+                    input_bytes = input_data.encode()
 
-                async def _feed_stdin():
-                    try:
-                        proc.stdin.write(input_bytes)
-                        await proc.stdin.drain()
-                    except Exception:
-                        pass
-                    finally:
+                    async def _feed_stdin():
                         try:
-                            proc.stdin.close()
+                            proc.stdin.write(input_bytes)
+                            await proc.stdin.drain()
                         except Exception:
                             pass
+                        finally:
+                            try:
+                                proc.stdin.close()
+                            except Exception:
+                                pass
 
                 try:
                     wall_timeout = (time_limit_ms / 1000.0) + 5.0
@@ -729,6 +1006,51 @@ class NsjailRunner:
 
         cpu_time_sec = user_time_sec + sys_time_sec
         return "\n".join(filtered).strip(), cpu_time_sec, mem_kb
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  Zombie reaper — cleans up orphaned nsjail processes
+# ─────────────────────────────────────────────────────────────────────────
+
+async def _zombie_reaper_loop():
+    """Periodically reap zombie child processes and stale temp directories."""
+    interval = settings.zombie_reaper_interval
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            # Reap zombie children
+            while True:
+                try:
+                    pid, _ = os.waitpid(-1, os.WNOHANG)
+                    if pid == 0:
+                        break
+                    logger.debug("Reaped zombie pid=%d", pid)
+                except ChildProcessError:
+                    break
+
+            # Clean stale temp dirs older than 5 minutes (not ccache_)
+            cutoff = time.time() - 300
+            temp_dir = settings.compiler_temp_dir
+            if os.path.isdir(temp_dir):
+                for entry in os.scandir(temp_dir):
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    if entry.name.startswith("ccache_"):
+                        continue
+                    try:
+                        mtime = entry.stat(follow_symlinks=False).st_mtime
+                        if mtime < cutoff:
+                            shutil.rmtree(entry.path, ignore_errors=True)
+                            logger.info("Cleaned stale temp dir: %s", entry.name)
+                    except OSError:
+                        pass
+        except Exception as exc:
+            logger.warning("Zombie reaper error: %s", exc)
+
+
+def start_zombie_reaper():
+    """Start the background zombie reaper task."""
+    asyncio.get_running_loop().create_task(_zombie_reaper_loop())
 
 
 # Global singleton

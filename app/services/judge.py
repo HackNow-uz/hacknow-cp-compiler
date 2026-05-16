@@ -15,8 +15,9 @@ from collections import deque
 from app.config import settings
 from app.languages import get_language
 from app.sandbox import nsjail_runner, ExecutionResult
+from app.sandbox.runner import check_disk_pressure, read_test_data
 from app.schemas.requests import (
-    CheckerConfig, JudgeRequest, Subtask, TestCase,
+    CheckerConfig, InteractiveConfig, JudgeRequest, Subtask, TestCase,
 )
 from app.schemas.responses import (
     ExecutionStatus, JudgeResponse, SubtaskResult, TestResult,
@@ -48,6 +49,18 @@ async def judge_submission(data: JudgeRequest) -> JudgeResponse:
     """
     judge_start = time.time()
     judge_inflight.labels(language=data.language_id).inc()
+
+    # Disk pressure check — return 503-like IE before wasting resources
+    if check_disk_pressure():
+        judge_inflight.labels(language=data.language_id).dec()
+        logger.warning("judge.disk_pressure: temp dir usage above threshold")
+        return JudgeResponse(
+            submission_id=data.submission_id,
+            problem_id=data.problem_id,
+            language_id=data.language_id,
+            status=ExecutionStatus.IE,
+            error="Service temporarily unavailable: disk pressure",
+        )
 
     language = get_language(data.language_id)
     if not language:
@@ -127,9 +140,42 @@ async def judge_submission(data: JudgeRequest) -> JudgeResponse:
                         error=f"Checker compilation error: {checker_compile_out[:500]}",
                     )
 
+        # ── 2b. Compile interactor if needed ───────────────────────────
+        interactor_dir = None
+        interactor_language = None
+        if data.interactive:
+            interactor_language = get_language(data.interactive.interactor_language_id or "cpp")
+            if not interactor_language:
+                return JudgeResponse(
+                    submission_id=data.submission_id,
+                    problem_id=data.problem_id,
+                    language_id=data.language_id,
+                    status=ExecutionStatus.IE,
+                    error=f"Unsupported interactor language: {data.interactive.interactor_language_id}",
+                )
+            interactor_dir, int_compile_out, _ = await nsjail_runner.compile_once(
+                language=interactor_language,
+                source_code=data.interactive.interactor_code,
+            )
+            if interactor_dir is None:
+                logger.error("judge.interactor_compile_error", extra={
+                    **log_extra, "interactor_output": int_compile_out[:500],
+                })
+                return JudgeResponse(
+                    submission_id=data.submission_id,
+                    problem_id=data.problem_id,
+                    language_id=data.language_id,
+                    status=ExecutionStatus.IE,
+                    compile_output=compile_output,
+                    compile_time_ms=compile_time_ms,
+                    error=f"Interactor compilation error: {int_compile_out[:500]}",
+                )
+
         # ── 3. Run tests ────────────────────────────────────────────────
         test_results = await _run_all_tests(
             data, language, compiled_dir, checker_dir,
+            interactor_dir=interactor_dir,
+            interactor_language=interactor_language,
         )
 
         # ── 4. Compute final verdict + score ─────────────────────────────
@@ -197,6 +243,8 @@ async def judge_submission(data: JudgeRequest) -> JudgeResponse:
             nsjail_runner.release_compiled(data.language_id, data.source_code)
         if checker_dir:
             shutil.rmtree(checker_dir, ignore_errors=True)
+        if interactor_dir:
+            shutil.rmtree(interactor_dir, ignore_errors=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -215,40 +263,132 @@ async def _run_single_test(
     language,
     compiled_dir: str,
     checker_dir: str | None,
+    interactor_dir: str | None = None,
+    interactor_language=None,
 ) -> TestResult:
-    """Execute a single test case inside an nsjail sandbox and return a TestResult."""
+    """Execute a single test case inside an nsjail sandbox and return a TestResult.
+
+    Supports inline and file-based test data, and interactive mode.
+    Graceful isolation: catches per-test exceptions and returns IE instead of crashing.
+    """
     time_limit = test.time_limit_ms or data.time_limit_ms
     memory_limit = test.memory_limit_mb or data.memory_limit_mb
 
-    result = await nsjail_runner.run_test(
-        language=language,
-        compiled_dir=compiled_dir,
-        input_data=test.input,
-        time_limit_ms=time_limit,
-        memory_limit_mb=memory_limit,
-    )
+    try:
+        # Resolve expected output (always needed for verdict checking)
+        expected_output = read_test_data(test.expected_output, test.expected_output_path)
 
-    status, checker_message = await _determine_test_status(
-        result, time_limit, memory_limit,
-        test.input, test.expected_output,
-        data.checker, checker_dir,
-    )
+        # For file-based input: stream directly from disk to avoid double read.
+        # Only read into memory when needed (interactive mode or inline input).
+        use_file_streaming = (test.input is None and test.input_path is not None)
 
-    score = test.score if status == ExecutionStatus.OK else 0
+        if interactor_dir and interactor_language:
+            # Interactive mode needs input in memory for the interactor header
+            test_input = read_test_data(test.input, test.input_path)
+            sub_result, int_result = await nsjail_runner.run_interactive(
+                language=language,
+                compiled_dir=compiled_dir,
+                interactor_dir=interactor_dir,
+                interactor_language=interactor_language,
+                test_input=test_input,
+                time_limit_ms=time_limit,
+                memory_limit_mb=memory_limit,
+            )
+            status, checker_message = _determine_interactive_status(
+                sub_result, int_result, time_limit, memory_limit,
+            )
+            exec_result = sub_result
+        else:
+            # Standard mode — stream from file if possible
+            if use_file_streaming:
+                result = await nsjail_runner.run_test(
+                    language=language,
+                    compiled_dir=compiled_dir,
+                    input_data="",
+                    time_limit_ms=time_limit,
+                    memory_limit_mb=memory_limit,
+                    input_file_path=test.input_path,
+                )
+                # For verdict checking, read input only if custom checker needs it
+                if data.checker and data.checker.type == "custom":
+                    test_input = read_test_data(test.input, test.input_path)
+                else:
+                    test_input = ""
+            else:
+                test_input = test.input or ""
+                result = await nsjail_runner.run_test(
+                    language=language,
+                    compiled_dir=compiled_dir,
+                    input_data=test_input,
+                    time_limit_ms=time_limit,
+                    memory_limit_mb=memory_limit,
+                )
 
-    judge_test_time_ms.labels(language=language.id).observe(result.time_ms)
+            status, checker_message = await _determine_test_status(
+                result, time_limit, memory_limit,
+                test_input, expected_output,
+                data.checker, checker_dir,
+            )
+            exec_result = result
 
-    return TestResult(
-        test_id=test.id,
-        status=status,
-        time_ms=result.time_ms,
-        memory_kb=result.memory_kb,
-        score=score,
-        stdout=_truncate(result.stdout, 500),
-        stderr=_truncate(result.stderr, 500),
-        subtask=test.subtask,
-        checker_message=checker_message,
-    )
+        score = test.score if status == ExecutionStatus.OK else 0
+
+        judge_test_time_ms.labels(language=language.id).observe(exec_result.time_ms)
+
+        return TestResult(
+            test_id=test.id,
+            status=status,
+            time_ms=exec_result.time_ms,
+            memory_kb=exec_result.memory_kb,
+            score=score,
+            stdout=_truncate(exec_result.stdout, 500),
+            stderr=_truncate(exec_result.stderr, 500),
+            subtask=test.subtask,
+            checker_message=checker_message,
+        )
+
+    except Exception as exc:
+        # Graceful isolation — one test crashing doesn't kill the whole judge
+        logger.error("Test %s failed with exception: %s", test.id, exc, exc_info=True)
+        return TestResult(
+            test_id=test.id,
+            status=ExecutionStatus.IE,
+            score=0,
+            subtask=test.subtask,
+            checker_message=f"Internal error: {str(exc)[:100]}",
+        )
+
+
+def _determine_interactive_status(
+    sub_result: ExecutionResult,
+    int_result: ExecutionResult,
+    time_limit_ms: int,
+    memory_limit_mb: int,
+) -> tuple[ExecutionStatus, str]:
+    """Determine verdict for interactive problems.
+
+    Interactor exit codes: 0=OK, 1=WA, 2=PE, 3=Partial (→WA).
+    Submission resource limits are checked first.
+    """
+    # Check submission resource limits first
+    if sub_result.output_limit_exceeded:
+        return ExecutionStatus.OLE, "Output limit exceeded"
+    if sub_result.timed_out or sub_result.time_ms > time_limit_ms:
+        return ExecutionStatus.TLE, ""
+    if sub_result.memory_exceeded or sub_result.memory_kb > memory_limit_mb * 1024:
+        return ExecutionStatus.MLE, ""
+    if sub_result.exit_code != 0 and not int_result.timed_out:
+        return ExecutionStatus.RTE, ""
+
+    # Interactor verdict
+    msg = "".join(c for c in (int_result.stderr or "").strip() if c.isprintable())[:64]
+    if int_result.exit_code == 0:
+        return ExecutionStatus.OK, msg
+    if int_result.exit_code == 1:
+        return ExecutionStatus.WA, msg or "Interactor rejected"
+    if int_result.exit_code == 2:
+        return ExecutionStatus.PE, msg or "Protocol error"
+    return ExecutionStatus.WA, msg or f"Interactor exit={int_result.exit_code}"
 
 
 async def _run_all_tests(
@@ -256,6 +396,8 @@ async def _run_all_tests(
     language,
     compiled_dir: str,
     checker_dir: str | None,
+    interactor_dir: str | None = None,
+    interactor_language=None,
 ) -> list[TestResult]:
     """
     Run every test in its own nsjail sandbox.
@@ -268,14 +410,22 @@ async def _run_all_tests(
     if fail_fast:
         test_results: list[TestResult] = []
         for test in data.tests:
-            tr = await _run_single_test(test, data, language, compiled_dir, checker_dir)
+            tr = await _run_single_test(
+                test, data, language, compiled_dir, checker_dir,
+                interactor_dir=interactor_dir,
+                interactor_language=interactor_language,
+            )
             test_results.append(tr)
             if tr.status != ExecutionStatus.OK:
                 break
         return test_results
 
     coros = [
-        _run_single_test(test, data, language, compiled_dir, checker_dir)
+        _run_single_test(
+            test, data, language, compiled_dir, checker_dir,
+            interactor_dir=interactor_dir,
+            interactor_language=interactor_language,
+        )
         for test in data.tests
     ]
     test_results = await asyncio.gather(*coros)

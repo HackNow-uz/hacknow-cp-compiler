@@ -47,6 +47,21 @@ async def lifespan(app: FastAPI):
     removed = _cleanup_stale_temp()
     if removed:
         logger.info("Cleaned up %d stale temp directories", removed)
+
+    # Ensure test-data directory exists
+    test_data_dir = settings.test_data_dir
+    if not os.path.isdir(test_data_dir):
+        try:
+            os.makedirs(test_data_dir, exist_ok=True)
+            logger.info("Created test data directory: %s", test_data_dir)
+        except OSError as e:
+            logger.warning("Could not create test data directory: %s", e)
+
+    # Start zombie reaper background task
+    from app.sandbox.runner import start_zombie_reaper
+    start_zombie_reaper()
+    logger.info("Zombie reaper started (interval=%ds)", settings.zombie_reaper_interval)
+
     yield
     logger.info("Shutting down %s", settings.service_name)
 

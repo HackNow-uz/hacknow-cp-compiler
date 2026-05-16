@@ -9,7 +9,7 @@ class Settings(BaseSettings):
 
     # Service
     service_name: str = "cp-compiler"
-    service_version: str = "2.3.0"
+    service_version: str = "2.4.0"
     service_host: str = "0.0.0.0"
     service_port: int = 8000
 
@@ -79,6 +79,38 @@ class Settings(BaseSettings):
     compile_cache_ttl_seconds: int = Field(
         default=600,
         description="Cache entry TTL in seconds.",
+    )
+
+    # File-based test delivery — test data read from disk instead of HTTP body.
+    test_data_dir: str = Field(
+        default="/test-data",
+        description="Root directory for file-based test case data.",
+    )
+    max_test_file_size_mb: int = Field(
+        default=256,
+        description="Max size of a single test file (input or expected output) in MB.",
+    )
+
+    # Disk usage monitoring — returns 503 when temp dir is nearly full.
+    temp_disk_usage_threshold: float = Field(
+        default=0.80,
+        description="Fraction of /compiler-temp used before returning 503.",
+    )
+
+    # Zombie process reaper interval (seconds).
+    zombie_reaper_interval: int = Field(
+        default=30,
+        description="Interval in seconds for reaping zombie nsjail processes.",
+    )
+
+    # Interactive problem support.
+    max_interactive_turns: int = Field(
+        default=10000,
+        description="Max stdin/stdout turns for interactive problems.",
+    )
+    interactive_idle_timeout_ms: int = Field(
+        default=5000,
+        description="Idle timeout per turn for interactive problems (ms).",
     )
 
 
