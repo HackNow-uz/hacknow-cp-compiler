@@ -17,6 +17,10 @@ class LanguageConfig:
     # Multipliers for interpreted / VM languages
     memory_multiplier: float = 1.0
     time_multiplier: float = 1.0
+    # Maksimal process/thread soni (rlimit_nproc). JVM (Java, Kotlin) va
+    # boshqa runtime'larga ko'p native thread kerak; default 128 ulargagi
+    # OutOfMemoryError'ga olib keladi.
+    nproc_limit: int = 128
     # Per-language sandbox tweaks -- each language may require its own
     # mounts or env vars (e.g. /usr/local/cargo for Rust, /opt for Kotlin).
     extra_env: dict[str, str] = field(default_factory=dict)
@@ -144,6 +148,7 @@ LANGUAGES: dict[str, LanguageConfig] = {
         compile_timeout_ms=30000,
         time_multiplier=2.0,
         memory_multiplier=2.0,
+        nproc_limit=512,
     ),
     "kotlin": LanguageConfig(
         id="kotlin",
@@ -164,6 +169,7 @@ LANGUAGES: dict[str, LanguageConfig] = {
         compile_timeout_ms=60000,
         time_multiplier=2.0,
         memory_multiplier=2.0,
+        nproc_limit=512,
     ),
 
     # -----------------------------------------------------------------

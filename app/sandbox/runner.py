@@ -282,6 +282,10 @@ class NsjailRunner:
         else:
             rlimit_as_mb = max(memory_limit_mb * 4, 512)
 
+        # JVM va boshqa ko'p thread'li runtime'lar uchun rlimit_nproc'ni
+        # language profile'idan olamiz; default 128.
+        nproc_limit = language.nproc_limit if language else 128
+
         bindmounts_ro = self._load_bindmounts()
 
         mount_args: list[str] = []
@@ -301,7 +305,7 @@ class NsjailRunner:
             "--rlimit_cpu", str(cpu_limit_sec),
             "--rlimit_as", str(rlimit_as_mb),
             "--rlimit_fsize", str(settings.output_limit_mb),
-            "--rlimit_nproc", "128",
+            "--rlimit_nproc", str(nproc_limit),
             "--rlimit_nofile", "256",
             "--rlimit_stack", "soft",
             "--user", "1000",
