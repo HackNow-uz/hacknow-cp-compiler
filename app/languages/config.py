@@ -160,7 +160,9 @@ LANGUAGES: dict[str, LanguageConfig] = {
         ],
         run_cmd=[
             "/usr/lib/jvm/java-17-openjdk-amd64/bin/java",
-            "-Xmx{memory}m", "-Xss64m", "-XX:+UseSerialGC",
+            "-Xmx{memory}m", "-Xss64m",
+            "-XX:MaxMetaspaceSize=64m", "-XX:CompressedClassSpaceSize=32m",
+            "-XX:+UseSerialGC",
             "-Dfile.encoding=UTF-8",
             "-jar", "solution.jar",
         ],

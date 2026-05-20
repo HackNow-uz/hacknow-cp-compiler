@@ -276,7 +276,10 @@ class NsjailRunner:
             )
         )
         if is_managed:
-            rlimit_as_mb = max(memory_limit_mb * 4, 2048)
+            # JVM (java/kotlin) -Xss64m × bir nechta native thread + class space
+            # virtual addressga ko'p hajm talab qiladi (cheklov real RAM emas,
+            # cgroups RAM'i alohida). Yetarli virtual address space berish.
+            rlimit_as_mb = max(memory_limit_mb * 8, 4096)
         elif language and language.id in ("haskell", "rust"):
             rlimit_as_mb = max(memory_limit_mb * 4, 1024)
         else:
