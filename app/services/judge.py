@@ -83,8 +83,16 @@ async def judge_submission(data: JudgeRequest) -> JudgeResponse:
     }
     logger.info("judge.start", extra=log_extra)
 
+    # NOTE: every name referenced by the `finally` block below MUST be bound
+    # here, BEFORE `try:`. The compile-error path returns from inside the try
+    # before step 2b, so initialising these there left `interactor_dir` unbound
+    # and the `finally` raised UnboundLocalError — which replaces the return
+    # value and turns every CE into an HTTP 500.
     compiled_dir = None
     checker_dir = None
+    checker_language = None
+    interactor_dir = None
+    interactor_language = None
     try:
         # ── 1. Compile submission once ──────────────────────────────────
         compiled_dir, compile_output, compile_time_ms = await nsjail_runner.compile_once(
@@ -120,10 +128,10 @@ async def judge_submission(data: JudgeRequest) -> JudgeResponse:
                     status=ExecutionStatus.IE,
                     error="Custom checkers are disabled by service policy",
                 )
-            checker_lang = get_language(data.checker.language_id or "cpp")
-            if checker_lang:
+            checker_language = get_language(data.checker.language_id or "cpp")
+            if checker_language:
                 checker_dir, checker_compile_out, _ = await nsjail_runner.compile_once(
-                    language=checker_lang,
+                    language=checker_language,
                     source_code=data.checker.code,
                 )
                 if checker_dir is None:
@@ -141,8 +149,6 @@ async def judge_submission(data: JudgeRequest) -> JudgeResponse:
                     )
 
         # ── 2b. Compile interactor if needed ───────────────────────────
-        interactor_dir = None
-        interactor_language = None
         if data.interactive:
             interactor_language = get_language(data.interactive.interactor_language_id or "cpp")
             if not interactor_language:
@@ -240,11 +246,23 @@ async def judge_submission(data: JudgeRequest) -> JudgeResponse:
         judge_inflight.labels(language=data.language_id).dec()
         if compiled_dir:
             shutil.rmtree(compiled_dir, ignore_errors=True)
-            nsjail_runner.release_compiled(data.language_id, data.source_code)
+            # `language.id`, not `data.language_id`: "cpp17"/"py" are aliases for
+            # "cpp"/"py3", and compile_once() caches under the canonical id — so
+            # releasing under the alias silently decremented nothing.
+            nsjail_runner.release_compiled(language.id, data.source_code)
+        # compile_once() takes one cache ref per successful compile — the
+        # checker and the interactor need releasing too, otherwise their
+        # ref_count never returns to 0 and the cache dir is never reclaimed.
         if checker_dir:
             shutil.rmtree(checker_dir, ignore_errors=True)
+            if checker_language:
+                nsjail_runner.release_compiled(checker_language.id, data.checker.code)
         if interactor_dir:
             shutil.rmtree(interactor_dir, ignore_errors=True)
+            if interactor_language:
+                nsjail_runner.release_compiled(
+                    interactor_language.id, data.interactive.interactor_code,
+                )
 
 
 # ─────────────────────────────────────────────────────────────────────────

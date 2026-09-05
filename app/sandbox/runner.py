@@ -551,6 +551,13 @@ class NsjailRunner:
                 except Exception as e:
                     logger.warning("compile_cache hardlink failed, recompiling: %s", e)
                     shutil.rmtree(work_dir, ignore_errors=True)
+                    # get() already took a ref for this entry; we are abandoning
+                    # it, so give it back or the entry can never be reclaimed.
+                    self._compile_cache.release(language.id, source_code)
+            elif cached:
+                # Entry is in the cache but its dir vanished underneath us.
+                # get() still took a ref — release it before recompiling.
+                self._compile_cache.release(language.id, source_code)
 
         # ── Compile ────────────────────────────────────────────────────
         work_dir = tempfile.mkdtemp(dir=settings.compiler_temp_dir)
