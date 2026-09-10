@@ -15,7 +15,7 @@ from collections import deque
 from app.config import settings
 from app.languages import get_language
 from app.sandbox import nsjail_runner, ExecutionResult
-from app.sandbox.runner import check_disk_pressure, read_test_data
+from app.sandbox.runner import SecurityError, check_disk_pressure, read_test_data
 from app.schemas.requests import (
     CheckerConfig, InteractiveConfig, JudgeRequest, Subtask, TestCase,
 )
@@ -363,6 +363,21 @@ async def _run_single_test(
             stderr=_truncate(exec_result.stderr, 500),
             subtask=test.subtask,
             checker_message=checker_message,
+        )
+
+    except (SecurityError, FileNotFoundError, ValueError) as exc:
+        # Bad or refused test-data path: a problem-configuration fault, never
+        # the submission's. Report IE and keep the resolved path out of the
+        # response — the full detail goes to the log for the operator.
+        logger.error(
+            "Test %s: test-data rejected: %s", test.id, exc, exc_info=True,
+        )
+        return TestResult(
+            test_id=test.id,
+            status=ExecutionStatus.IE,
+            score=0,
+            subtask=test.subtask,
+            checker_message="Internal error: test data unavailable",
         )
 
     except Exception as exc:

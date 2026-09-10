@@ -876,6 +876,16 @@ class NsjailRunner:
             language=language,
         )
 
+        # Validate the test-data path BEFORE spawning anything. The broad
+        # `except Exception` around the subprocess block below turns any error
+        # into ExecutionResult(exit_code=1), which the verdict layer reads as
+        # RTE — i.e. a rejected path or a setter's typo would be reported as
+        # the *student's* runtime error, with the path echoed back to them.
+        # Validating here lets the exception reach the per-test handler in
+        # judge.py, which correctly reports IE.
+        if input_file_path:
+            _validate_test_file_path(input_file_path)
+
         semaphore = self.get_semaphore(language.id)
         max_output_bytes = settings.output_limit_mb * 1024 * 1024
         # stderr is capped much smaller — runner doesn't need 16MB of stderr,

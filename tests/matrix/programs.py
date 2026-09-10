@@ -100,10 +100,13 @@ PROGRAMS = {
         "ce":  'main = do { let x = }',
         "rte": 'main = error "boom"',
         "tle": 'loop :: Int -> Int\nloop n = loop (n+1)\nmain = print (loop 0)',
-        # NOTE: `length (replicate n x)` alone is fused away by GHC and allocates
-        # nothing (it returned WA, not MLE). Consuming `xs` twice forces the whole
-        # list to be retained.
-        "mle": 'main = let xs = replicate 100000000 (1::Int) in print (length xs + last xs)',
+        # NOTE two GHC traps here. `length (replicate n x)` is fused away and
+        # allocates nothing (returned WA). Retaining a 100M boxed-Int list does
+        # allocate, but so slowly that the time limit trips first (returned TLE
+        # even at 8s). A strict ByteString is a contiguous memset-speed
+        # allocation, so the memory ceiling is what actually binds: MLE in
+        # ~170ms at 412 MB measured.
+        "mle": 'import qualified Data.ByteString as B\nmain = print (B.length (B.replicate (400*1024*1024) 65))',
         "ole": 'main = putStr (replicate 40000000 \'A\')',
     },
     "js": {

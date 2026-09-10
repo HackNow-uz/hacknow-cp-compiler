@@ -20,13 +20,21 @@ EXPECTED = {
     "ok": "OK", "wa": "WA", "ce": "CE",
     "rte": "RTE", "tle": "TLE", "mle": "MLE", "ole": "OLE",
 }
+# MLE and OLE need time to actually reach their resource ceiling. Under the
+# default 1s limit the time limit becomes the binding constraint on a loaded
+# host and the cell flaps between MLE and TLE (observed on haskell: 1221ms one
+# run, TLE the next). Give those cells room so the resource under test is the
+# one that trips.
+TIME_LIMIT_OVERRIDES = {"mle": 8000, "ole": 8000}
+
 # Verdicts that legitimately have more than one acceptable outcome.
 TOLERATED = {
     # A memory-starved runtime often dies via its own allocator instead of the
     # cgroup killer; both are correct rejections of an over-allocating program.
     "mle": {"MLE", "RTE"},
-    # Flooding stdout can trip the output cap or the time cap first.
-    "ole": {"OLE", "TLE"},
+    # Flooding stdout trips the output cap; with the raised limit above, time
+    # is no longer a plausible competing outcome.
+    "ole": {"OLE"},
     # Interpreters with no separate compile step surface syntax errors at
     # runtime; the judge is entitled to report either.
     "ce": {"CE", "RTE"},
@@ -82,8 +90,9 @@ def main():
             want = EXPECTED[v]
             allowed = TOLERATED.get(v, {want})
             t0 = time.time()
+            tlim = TIME_LIMIT_OVERRIDES.get(v, a.time_limit)
             code, body = judge(a.base, a.token, lang, src,
-                               a.time_limit, a.memory_limit, a.timeout)
+                               tlim, a.memory_limit, a.timeout)
             ms = int((time.time() - t0) * 1000)
             got = body.get("status", "HTTP%s" % code)
             cells += 1
