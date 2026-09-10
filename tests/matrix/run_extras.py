@@ -78,6 +78,49 @@ int main(){ sleep(30); return 0; }
 '''
 
 
+
+# ── custom checker ────────────────────────────────────────────────────────
+# NOTE: this judge does NOT use the Polygon/testlib argv convention. The
+# checker receives everything on stdin as three length-prefixed sections:
+#     <len(input)>\n<input>\n<len(expected)>\n<expected>\n<len(actual)>\n<actual>\n
+# Exit codes: 0=OK, 1=WA, 2=PE, 3=Partial(->WA).
+# A testlib checker calling registerTestlibCmd(argc, argv) cannot work here
+# even if testlib.h were present — see finding F-02.
+CHECKER_NATIVE = r'''
+#include <iostream>
+#include <string>
+#include <vector>
+static std::string section(std::istream& in){
+    size_t n; if(!(in >> n)) return ""; in.get();
+    std::vector<char> buf(n); in.read(buf.data(), n); in.get();
+    return std::string(buf.begin(), buf.end());
+}
+int main(){
+    std::string inp = section(std::cin);
+    std::string exp = section(std::cin);
+    std::string got = section(std::cin);
+    auto trim = [](std::string s){
+        while(!s.empty() && isspace((unsigned char)s.back())) s.pop_back();
+        return s;
+    };
+    if (trim(exp) == trim(got)) return 0;
+    std::cerr << "expected " << trim(exp);
+    return 1;
+}
+'''
+
+# A checker written the Polygon way — should NOT be able to validate anything,
+# because argv is never populated. Documents the incompatibility as a test.
+CHECKER_ARGV_STYLE = r'''
+#include <fstream>
+#include <iostream>
+int main(int argc, char** argv){
+    if (argc < 4) { std::cerr << "no argv files"; return 1; }
+    std::ifstream ans(argv[3]); std::string e; ans >> e;
+    return e.empty() ? 1 : 0;
+}
+'''
+
 def post(base, token, payload, timeout=180):
     req = urllib.request.Request(
         base + "/api/v1/judge",
@@ -206,6 +249,73 @@ def main():
                                  "input_path": path, "expected_output": "5"}]),
             {"IE"},
         ))
+
+
+    # ── custom checker (native stdin protocol) ────────────────────────────
+    def checker(code):
+        return {"type": "custom", "code": code, "language_id": "cpp"}
+
+    probes.append((
+        "checker: native protocol accepts correct output",
+        base_request(submission_id="ck-ok", source_code=SUM,
+                     tests=[{"id": "t1", "input": "2 3",
+                             "expected_output": "5", "score": 10}],
+                     checker=checker(CHECKER_NATIVE)),
+        {"OK"},
+    ))
+    probes.append((
+        "checker: native protocol rejects wrong output",
+        base_request(submission_id="ck-wa",
+                     source_code='#include <iostream>\nint main(){std::cout<<99;}',
+                     tests=[{"id": "t1", "input": "2 3",
+                             "expected_output": "5", "score": 10}],
+                     checker=checker(CHECKER_NATIVE)),
+        {"WA"},
+    ))
+    probes.append((
+        "checker: Polygon/argv style cannot validate (F-02)",
+        base_request(submission_id="ck-argv", source_code=SUM,
+                     tests=[{"id": "t1", "input": "2 3",
+                             "expected_output": "5", "score": 10}],
+                     checker=checker(CHECKER_ARGV_STYLE)),
+        {"WA"},   # argv is empty -> checker reports failure on a correct answer
+    ))
+
+    # ── IOI subtasks: aggregation + depends_on ordering ───────────────────
+    HALF = ('#include <iostream>\n'
+            'int main(){int a,b;std::cin>>a>>b;'
+            'std::cout<<(a+b==5?5:0);}')   # right on t1, wrong on t2
+    sub_tests = [
+        {"id": "s1t1", "input": "2 3", "expected_output": "5", "score": 10,
+         "subtask": "s1"},
+        {"id": "s2t1", "input": "4 4", "expected_output": "8", "score": 10,
+         "subtask": "s2"},
+    ]
+    probes.append((
+        "subtasks: all pass -> OK with full score",
+        base_request(submission_id="st-ok", source_code=SUM, tests=sub_tests,
+                     stop_on_first_failure=False,
+                     subtasks=[{"id": "s1", "max_score": 40, "score_mode": "min"},
+                               {"id": "s2", "max_score": 60, "score_mode": "min"}]),
+        {"OK"},
+    ))
+    probes.append((
+        "subtasks: dependent subtask skipped when dep fails",
+        base_request(submission_id="st-dep", source_code=HALF, tests=sub_tests,
+                     stop_on_first_failure=False,
+                     subtasks=[{"id": "s1", "max_score": 40, "score_mode": "min"},
+                               {"id": "s2", "max_score": 60, "score_mode": "min",
+                                "depends_on": ["s1"]}]),
+        {"WA", "SK"},
+    ))
+    probes.append((
+        "subtasks: sum mode awards partial credit",
+        base_request(submission_id="st-sum", source_code=HALF, tests=sub_tests,
+                     stop_on_first_failure=False,
+                     subtasks=[{"id": "s1", "max_score": 40, "score_mode": "sum"},
+                               {"id": "s2", "max_score": 60, "score_mode": "sum"}]),
+        {"WA"},
+    ))
 
     print("%-52s %-6s %-6s %s" % ("PROBE", "WANT", "GOT", "RESULT"))
     print("-" * 92)
