@@ -1,5 +1,7 @@
+import os
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field
+from pydantic import Field, model_validator
 
 
 class Settings(BaseSettings):
@@ -14,9 +16,26 @@ class Settings(BaseSettings):
     service_port: int = 8000
 
     # Security
+    # ⭐ Token FAYLdan o'qiladi (`INTERNAL_TOKEN_FILE`), env'dan EMAS — shunda u
+    # jarayon muhitida (/proc/<pid>/environ) turmaydi. Sandbox (nsjail) server bilan
+    # AYNI uid'da ishlagani uchun yuborilgan kod server environ'ini o'qiy olardi va
+    # tokenni o'g'irlardi (2026-10-04 auditi). Fayl yo'q bo'lsa — env'ga qaytiladi (back-compat).
     internal_token: str = Field(
+        default="",
         description="Bearer token for service-to-service authentication"
     )
+
+    @model_validator(mode="after")
+    def _load_token_from_file(self):
+        if not self.internal_token:
+            path = os.environ.get("INTERNAL_TOKEN_FILE", "").strip()
+            if path and os.path.isfile(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as fh:
+                        object.__setattr__(self, "internal_token", fh.read().strip())
+                except OSError:
+                    pass
+        return self
 
     # Temp directories
     compiler_temp_dir: str = Field(
