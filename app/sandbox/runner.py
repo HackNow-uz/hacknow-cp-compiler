@@ -282,6 +282,11 @@ class NsjailRunner:
             rlimit_as_mb = max(memory_limit_mb * 8, 4096)
         elif language and language.id in ("haskell", "rust"):
             rlimit_as_mb = max(memory_limit_mb * 4, 1024)
+        elif language and language.id == "pypy3":
+            # PyPy sys.setrecursionlimit(10**6) stek uchun ~2 GB virtual manzil
+            # zaxiralaydi; 1024 MB da MemoryError beradi (rekursiv DFS yechimlar
+            # RTE oladi). Haqiqiy RAM memory_kb orqali alohida tekshiriladi.
+            rlimit_as_mb = max(memory_limit_mb * 4, 3072)
         else:
             rlimit_as_mb = max(memory_limit_mb * 4, 512)
 
