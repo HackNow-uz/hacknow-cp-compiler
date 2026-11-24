@@ -116,6 +116,11 @@ class ConcurrencyStats(BaseModel):
 
     global_slots: int = 0
     per_language_slots: int = 0
+    # Hozir band slotlar (shu nusxada). `None` — o'lchab bo'lmadi.
+    global_in_use: Optional[int] = None
+    # /judge so'rovlari: hozir ishlanayotgani va shu nusxa qabul qiladigan eng ko'pi (oshsa 503 qaytadi).
+    judge_inflight: Optional[int] = None
+    judge_max_inflight: Optional[int] = None
 
 
 class HealthResponse(BaseModel):
